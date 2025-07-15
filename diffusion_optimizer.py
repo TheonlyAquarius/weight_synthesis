@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+from safetensors.torch import load_file, save_file
 
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
@@ -95,66 +96,68 @@ class DiffusionOptimizer(nn.Module):
             ]
         )
         self.dropout = nn.Dropout(dropout)
+        self.projection_layers = nn.ModuleDict()
+        self.unprojection_layers = nn.ModuleDict()
 
-    def forward(self, weights, t):
-        # Process one tensor at a time
-        denoised_weights = []
-        for weight_tensor in weights:
-            # 1. Project to embedding dimension
-            original_shape = weight_tensor.shape
-            if weight_tensor.dim() == 1:
-                weight_tensor = weight_tensor.unsqueeze(0) # Add batch dimension if missing
+    def _get_projection_key(self, shape):
+        return str(list(shape))
 
-            # Reshape to (batch_size, seq_len, features)
-            # For a single tensor, seq_len is the number of elements
-            if weight_tensor.dim() > 2:
-                # This is a basic way to handle tensors with more than 2 dimensions.
-                # It flattens the tensor and then adds a sequence dimension.
-                # A more sophisticated approach might use 1x1 convolutions to project
-                # to the embedding dimension while preserving spatial structure.
-                # However, to avoid hard-coding, we'll use this general approach.
-                num_elements = weight_tensor.numel() // weight_tensor.shape[0]
-                x = weight_tensor.reshape(weight_tensor.shape[0], num_elements, -1)
-            else:
-                x = weight_tensor.unsqueeze(1) # Add sequence dimension
+    def _ensure_projection_layers(self, key, tensor):
+        if key not in self.projection_layers:
+            num_features = tensor.numel()
+            self.projection_layers[key] = nn.Linear(num_features, self.embed_dim)
+            self.unprojection_layers[key] = nn.Linear(self.embed_dim, num_features)
 
-            # Ensure the feature dimension matches embed_dim.
-            # This is a critical step and requires a flexible way to project.
-            # A linear layer can do this, but its input size must be known.
-            # We can create it dynamically or use a more flexible projection.
-            # For simplicity, we'll assume the last dimension can be projected.
-            # This is a potential area for improvement to be more robust.
-            feature_dim = x.shape[-1]
-            if not hasattr(self, f'input_projection_{feature_dim}'):
-                setattr(self, f'input_projection_{feature_dim}', nn.Linear(feature_dim, self.embed_dim))
+    def forward(self, weights_dict, t):
+        device = next(self.parameters()).device
+        vectors = []
+        shapes = {}
+        keys_order = []
 
-            x = getattr(self, f'input_projection_{feature_dim}')(x)
+        for key, tensor in weights_dict.items():
+            shape_key = self._get_projection_key(tensor.shape)
+            self._ensure_projection_layers(shape_key, tensor)
 
-            # 2. Add timestep embedding
-            timestep_embedding = self.get_timestep_embedding(t, self.embed_dim).to(x.device)
-            x += timestep_embedding.unsqueeze(1) # Add to each element in the sequence
+            tensor_in = tensor.to(device).flatten()
+            vectors.append(self.projection_layers[shape_key](tensor_in))
 
-            # 3. Transformer blocks
-            for layer in self.layers:
-                x = layer(x, x, x, mask=None)
+            shapes[key] = tensor.shape
+            keys_order.append(key)
 
-            # 4. Project back to original feature dimension
-            if not hasattr(self, f'output_projection_{feature_dim}'):
-                setattr(self, f'output_projection_{feature_dim}', nn.Linear(self.embed_dim, feature_dim))
+        # Create a sequence tensor
+        sequence = torch.stack(vectors, dim=0).unsqueeze(0) # (1, L, embed_dim)
 
-            x = getattr(self, f'output_projection_{feature_dim}')(x)
+        # Add positional embeddings
+        positional_embeddings = self.get_positional_embedding(len(keys_order), self.embed_dim).to(device)
+        sequence += positional_embeddings
 
-            # 5. Reshape back to original tensor shape
-            if len(original_shape) > 2:
-                 denoised_tensor = x.reshape(original_shape)
-            elif len(original_shape) == 1:
-                denoised_tensor = x.squeeze(1).squeeze(0)
-            else: # len(original_shape) == 2
-                 denoised_tensor = x.squeeze(1)
+        # Add timestep embedding
+        timestep_embedding = self.get_timestep_embedding(t, self.embed_dim).to(device)
+        sequence += timestep_embedding.unsqueeze(1)
 
-            denoised_weights.append(denoised_tensor)
+        # Transformer blocks
+        for layer in self.layers:
+            sequence = layer(sequence, sequence, sequence, mask=None)
+
+        # Denoise and reconstruct
+        denoised_weights = {}
+        for i, key in enumerate(keys_order):
+            shape = shapes[key]
+            shape_key = self._get_projection_key(shape)
+            output_vector = sequence.squeeze(0)[i]
+
+            reconstructed_tensor = self.unprojection_layers[shape_key](output_vector)
+            denoised_weights[key] = reconstructed_tensor.reshape(shape)
 
         return denoised_weights
+
+    def get_positional_embedding(self, seq_len, embed_dim):
+        position = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
+        pos_emb = torch.zeros(seq_len, embed_dim)
+        pos_emb[:, 0::2] = torch.sin(position * div_term)
+        pos_emb[:, 1::2] = torch.cos(position * div_term)
+        return pos_emb.unsqueeze(0)
 
     def get_timestep_embedding(self, t, embed_dim):
         half_dim = embed_dim // 2
@@ -168,7 +171,7 @@ class DiffusionOptimizer(nn.Module):
 
 
 if __name__ == "__main__":
-    # 1. Define a toy model
+    # 1. Define a toy model and save its weights to a .safetensors file
     class ToyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -184,7 +187,11 @@ if __name__ == "__main__":
             return x
 
     toy_model = ToyModel()
-    weights = list(toy_model.parameters())
+    weights = toy_model.state_dict()
+
+    # Save to a temporary file
+    temp_weights_file = "temp_weights.safetensors"
+    save_file(weights, temp_weights_file)
 
     # 2. Initialize the Diffusion Optimizer
     optimizer = DiffusionOptimizer(
@@ -195,15 +202,22 @@ if __name__ == "__main__":
         dropout=0.1,
     )
 
-    # 3. Create a dummy timestep
+    # 3. Load the weights from the .safetensors file
+    loaded_weights = load_file(temp_weights_file)
+
+    # 4. Create a dummy timestep
     t = torch.randint(0, 1000, (1,))
 
-    # 4. Get the denoised weights
-    denoised_weights = optimizer(weights, t)
+    # 5. Get the denoised weights
+    denoised_weights = optimizer(loaded_weights, t)
 
-    # 5. Check that the output shapes match the input shapes
-    for i, (original, denoised) in enumerate(zip(weights, denoised_weights)):
-        assert original.shape == denoised.shape, \
-            f"Shape mismatch for weight {i}: original {original.shape}, denoised {denoised.shape}"
+    # 6. Check that the output shapes match the input shapes
+    for key in loaded_weights.keys():
+        assert loaded_weights[key].shape == denoised_weights[key].shape, \
+            f"Shape mismatch for weight {key}: original {loaded_weights[key].shape}, denoised {denoised_weights[key].shape}"
 
     print("Diffusion Optimizer ran successfully!")
+
+    # 7. Clean up the temporary file
+    import os
+    os.remove(temp_weights_file)
