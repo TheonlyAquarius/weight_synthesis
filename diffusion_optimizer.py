@@ -187,7 +187,8 @@ class WeightDiffusionMLP(nn.Module):
 
 
 def _prepare_dataloader(dataset: ModelZooDataset, batch_size: int) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=len(dataset) > 1)
+    drop_last = len(dataset) >= batch_size and batch_size > 0
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=drop_last)
 
 
 def train_synthesizer(
