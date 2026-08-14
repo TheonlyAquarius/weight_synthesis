@@ -97,3 +97,24 @@ def test_training_and_generation(tmp_path):
     spectra = compute_spectral_properties(generated[0])
     for values in spectra.values():
         assert values.min().item() >= -1e-5
+
+
+def test_training_uses_dataset_smaller_than_batch_size(tmp_path):
+    paths = _write_corpus(tmp_path, count=2)
+    dataset = ModelZooDataset(paths)
+    schedule = DiffusionSchedule(timesteps=2)
+    model = WeightDiffusionMLP(
+        parameter_dim=dataset.feature_dim,
+        bottleneck_dim=16,
+    )
+
+    losses = train_synthesizer(
+        model,
+        dataset,
+        schedule,
+        epochs=2,
+        batch_size=len(dataset) + 1,
+        lr=1e-3,
+    )
+
+    assert len(losses) == 2
